@@ -1,4 +1,4 @@
-# Automated Docsite Prototype
+# TechOps Docsite Update Automation
 
 FastAPI prototype for a GitHub App that detects merged source PRs and opens AI-generated documentation PRs against a separate MkDocs repo.
 
@@ -22,7 +22,7 @@ Optional OpenRouter settings:
 
 ```bash
 OPENROUTER_BASE_URL=https://openrouter.ai/api/v1
-OPENROUTER_HTTP_REFERER=https://github.com/koredeBNB/automated-docsite-prototype
+OPENROUTER_HTTP_REFERER=https://github.com/bnb-chain/techops-docsite-update-automation
 OPENROUTER_APP_TITLE="AI Docsite Update Prototype"
 ```
 
