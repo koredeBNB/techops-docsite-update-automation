@@ -1,0 +1,230 @@
+from __future__ import annotations
+
+import pytest
+
+from docsite_updater.ai import RuleBasedAIClient
+from docsite_updater.config import Settings
+from docsite_updater.github import InMemoryGitHubClient, SourcePullRequestFixture
+from docsite_updater.models import AIUpdateResult, AIUsage, ChangedFile, DocFile, DocUpdate, DocUpdateJob, PullRequestContext
+from docsite_updater.observability import MemoryLogger, MemoryMetrics
+from docsite_updater.queue import PermanentJobError
+from docsite_updater.validator import MockMkDocsValidator
+from docsite_updater.worker import DocUpdateWorker, build_pr_body
+
+
+def make_worker_context(*, diff: str, low_confidence: bool = False, invalid_output: bool = False, validator_passes: bool = True):
+    settings = Settings(
+        github_app_id="123",
+        github_private_key="private",
+        github_webhook_secret="webhook",
+        docsite_repo="bnb-chain/mock-bnb-docsite",
+        ai_api_key="ai-key",
+        reviewer_logins=("docs-reviewer",),
+    )
+    job = DocUpdateJob(
+        source_repo="bnb-chain/mock-bsc-app",
+        pr_number=7,
+        merge_commit_sha="abc123def4567890",
+        default_branch="main",
+        installation_id=42,
+        source_pr_url="https://github.com/bnb-chain/mock-bsc-app/pull/7",
+        correlation_id="request-1",
+    )
+    github = InMemoryGitHubClient(
+        docsite_repo=settings.docsite_repo,
+        source_prs={
+            job.identity: SourcePullRequestFixture(
+                repo=job.source_repo,
+                number=job.pr_number,
+                merge_commit_sha=job.merge_commit_sha,
+                url=job.source_pr_url,
+                diff=diff,
+                changed_files=[ChangedFile(path="src/api.py", status="modified")],
+            )
+        },
+        doc_files={"docs/api.md": "# API\n\nCurrent API documentation."},
+    )
+    logger = MemoryLogger()
+    metrics = MemoryMetrics()
+    worker = DocUpdateWorker(
+        settings=settings,
+        github=github,
+        ai=RuleBasedAIClient(low_confidence=low_confidence, invalid_output=invalid_output),
+        validator=MockMkDocsValidator(should_pass=validator_passes),
+        logger=logger,
+        metrics=metrics,
+    )
+    return worker, job, github, logger, metrics
+
+
+class FixedAIClient:
+    def __init__(self, result: AIUpdateResult) -> None:
+        self.result = result
+
+    def propose_doc_updates(self, pr_context: PullRequestContext, docs: list[DocFile]) -> AIUpdateResult:
+        return self.result
+
+
+def test_worker_creates_no_pr_when_ai_reports_no_doc_change() -> None:
+    worker, job, github, _, metrics = make_worker_context(diff="NO_DOC_CHANGE: internal refactor")
+
+    result = worker.run(job)
+
+    assert result.status == "no_changes_needed"
+    assert github.pull_requests == []
+    assert metrics.counters["job.no_changes_needed"] == 1
+
+
+def test_worker_creates_docsite_pr_for_relevant_api_change() -> None:
+    worker, job, github, _, metrics = make_worker_context(diff="+ API endpoint get_validator now returns validator status")
+
+    result = worker.run(job)
+
+    assert result.status == "created_pr"
+    assert result.pr is not None
+    assert result.pr.url == "https://github.com/bnb-chain/mock-bnb-docsite/pull/1"
+    assert result.pr.changed_files == ["docs/api.md"]
+    assert "Automated Update" in github.doc_files["docs/api.md"]
+    assert github.requested_reviewers[1] == ["docs-reviewer"]
+    assert metrics.counters["docs_pr.created"] == 1
+
+
+def test_worker_rejects_ai_update_that_mutates_existing_numeric_value() -> None:
+    settings = Settings(
+        github_app_id="123",
+        github_private_key="private",
+        github_webhook_secret="webhook",
+        docsite_repo="koredeBNB/mock-mkdocs-repo",
+        ai_api_key="ai-key",
+    )
+    job = DocUpdateJob(
+        source_repo="koredeBNB/mock-bsc-app",
+        pr_number=7,
+        merge_commit_sha="abc123def4567890",
+        default_branch="main",
+        installation_id=42,
+        source_pr_url="https://github.com/koredeBNB/mock-bsc-app/pull/7",
+        correlation_id="request-1",
+    )
+    original_doc = """# Validators
+
+The response includes validator_id, status, and commission_rate.
+
+Example response:
+{
+  "validator_id": "validator-1",
+  "status": "active",
+  "commission_rate": 0.05
+}
+"""
+    hallucinated_doc = """# Validators
+
+The response includes validator_id, status, commission_rate, and voting_power.
+
+Example response:
+{
+  "validator_id": "validator-1",
+  "status": "active",
+  "commission_rate": -0.05,
+  "voting_power": 1000
+}
+"""
+    github = InMemoryGitHubClient(
+        docsite_repo=settings.docsite_repo,
+        source_prs={
+            job.identity: SourcePullRequestFixture(
+                repo=job.source_repo,
+                number=job.pr_number,
+                merge_commit_sha=job.merge_commit_sha,
+                url=job.source_pr_url,
+                diff='+        "voting_power": 1000,',
+                changed_files=[ChangedFile(path="src/mock_bsc_app/validators.py", status="modified")],
+            )
+        },
+        doc_files={"docs/validators.md": original_doc},
+    )
+    metrics = MemoryMetrics()
+    logger = MemoryLogger()
+    worker = DocUpdateWorker(
+        settings=settings,
+        github=github,
+        ai=FixedAIClient(
+            AIUpdateResult(
+                status="updates",
+                summary="Added voting_power.",
+                updates=[
+                    DocUpdate(
+                        path="docs/validators.md",
+                        content=hallucinated_doc,
+                        rationale="API added voting_power.",
+                        confidence=0.95,
+                    )
+                ],
+                usage=AIUsage(model="test", prompt_version="test"),
+            )
+        ),
+        validator=MockMkDocsValidator(),
+        logger=logger,
+        metrics=metrics,
+    )
+
+    result = worker.run(job)
+
+    assert result.status == "safety_rejected"
+    assert "0.05" in result.message
+    assert "-0.05" in result.message
+    assert github.pull_requests == []
+    assert github.doc_files["docs/validators.md"] == original_doc
+    assert metrics.counters["job.safety_rejected"] == 1
+    assert "ai_update_safety_rejected" in logger.as_json_lines()
+
+
+def test_worker_rejects_invalid_ai_output_safely() -> None:
+    worker, job, github, _, _ = make_worker_context(diff="+ API changed", invalid_output=True)
+
+    with pytest.raises(PermanentJobError):
+        worker.run(job)
+
+    assert github.pull_requests == []
+
+
+def test_low_confidence_ai_output_does_not_create_pr() -> None:
+    worker, job, github, _, metrics = make_worker_context(diff="+ API changed", low_confidence=True)
+
+    result = worker.run(job)
+
+    assert result.status == "low_confidence"
+    assert github.pull_requests == []
+    assert metrics.counters["job.low_confidence"] == 1
+
+
+def test_worker_logs_prompt_and_model_audit_metadata() -> None:
+    worker, job, _, logger, _ = make_worker_context(diff="+ API endpoint changed")
+
+    worker.run(job)
+
+    logs = logger.as_json_lines()
+    assert "mock-rule-based" in logs
+    assert "prototype-v1" in logs
+    assert "token_usage" in logs
+    assert job.identity in logs
+
+
+def test_pr_body_contains_source_traceability_and_reviewer_checklist() -> None:
+    job = DocUpdateJob(
+        source_repo="bnb-chain/mock-bsc-app",
+        pr_number=7,
+        merge_commit_sha="abc123",
+        default_branch="main",
+        installation_id=42,
+        source_pr_url="https://github.com/bnb-chain/mock-bsc-app/pull/7",
+        correlation_id="request-1",
+    )
+
+    body = build_pr_body(job=job, summary="Docs updated.", changed_files=["docs/api.md"])
+
+    assert "bnb-chain/mock-bsc-app" in body
+    assert "https://github.com/bnb-chain/mock-bsc-app/pull/7" in body
+    assert "abc123" in body
+    assert "`docs/api.md`" in body
+    assert "Reviewer Checklist" in body

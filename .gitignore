@@ -1,0 +1,11 @@
+__pycache__/
+.pytest_cache/
+.venv/
+dist/
+*.egg-info/
+node_modules/
+.env
+*.pem
+docs/
+mock-bsc-app/
+mock-mkdocs-repo/

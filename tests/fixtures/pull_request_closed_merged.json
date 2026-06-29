@@ -1,0 +1,19 @@
+{
+  "action": "closed",
+  "installation": {
+    "id": 42
+  },
+  "repository": {
+    "full_name": "bnb-chain/mock-bsc-app",
+    "default_branch": "main"
+  },
+  "pull_request": {
+    "number": 7,
+    "merged": true,
+    "merge_commit_sha": "abc123def4567890",
+    "html_url": "https://github.com/bnb-chain/mock-bsc-app/pull/7",
+    "base": {
+      "ref": "main"
+    }
+  }
+}
