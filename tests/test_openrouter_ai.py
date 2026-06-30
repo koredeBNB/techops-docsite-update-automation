@@ -55,6 +55,13 @@ def test_system_prompt_forbids_unrelated_value_mutations() -> None:
     assert "keep all existing example values exactly unchanged" in prompt
 
 
+def test_system_prompt_requires_playground_for_new_public_api() -> None:
+    prompt = system_prompt()
+
+    assert "adds a new public API" in prompt
+    assert "Do not skip playground updates" in prompt
+
+
 def test_openrouter_client_posts_strict_json_request_and_parses_updates() -> None:
     captured: dict[str, object] = {}
 
@@ -152,6 +159,42 @@ def test_openrouter_client_parses_playground_updates() -> None:
     assert result.status == "updates"
     assert result.updates[0].repo_role == "playground"
     assert result.updates[0].path == "src/validatorStatus.ts"
+
+
+def test_openrouter_client_normalizes_percentage_confidence() -> None:
+    def handler(_: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "choices": [
+                    {
+                        "message": {
+                            "content": json.dumps(
+                                {
+                                    "status": "updates",
+                                    "summary": "Updated docs.",
+                                    "updates": [
+                                        {
+                                            "repo_role": "docsite",
+                                            "path": "docs/gas-fees.md",
+                                            "content": "# Gas Fees\n",
+                                            "rationale": "The API changed.",
+                                            "confidence": 92,
+                                        }
+                                    ],
+                                }
+                            )
+                        }
+                    }
+                ]
+            },
+        )
+
+    client = OpenRouterAIClient(api_key="or-key", client=httpx.Client(transport=httpx.MockTransport(handler)))
+
+    result = client.propose_doc_updates(make_pr_context(), [])
+
+    assert result.updates[0].confidence == 0.92
 
 
 def test_openrouter_client_rejects_unsafe_playground_paths() -> None:

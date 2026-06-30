@@ -237,15 +237,21 @@ class GitHubAppClient:
         owner, repo = _split_repo(self._repo_for_role(repo_role))
         changed_files: list[str] = []
         for update in updates:
-            current_content, sha = self._get_file_content(owner=owner, repo=repo, path=update.path, ref=branch_name)
+            current_content, sha = self._get_file_content_or_missing(
+                owner=owner,
+                repo=repo,
+                path=update.path,
+                ref=branch_name,
+            )
             if current_content == update.content:
                 continue
             payload = {
                 "message": f"Update {update.path} from AI docsite updater",
                 "content": base64.b64encode(update.content.encode("utf-8")).decode("ascii"),
                 "branch": branch_name,
-                "sha": sha,
             }
+            if sha:
+                payload["sha"] = sha
             response = self._client().put(
                 self._url(f"/repos/{owner}/{repo}/contents/{update.path}"),
                 headers=self._installation_headers(),
@@ -349,6 +355,14 @@ class GitHubAppClient:
             raise GitHubClientError(f"GitHub content response for {path} was missing content or sha")
         content = base64.b64decode(encoded.encode("ascii"), validate=False).decode("utf-8")
         return content, sha
+
+    def _get_file_content_or_missing(self, *, owner: str, repo: str, path: str, ref: str) -> tuple[str, str | None]:
+        try:
+            return self._get_file_content(owner=owner, repo=repo, path=path, ref=ref)
+        except httpx.HTTPStatusError as exc:
+            if exc.response.status_code == 404:
+                return "", None
+            raise
 
     def _get_json(self, path: str) -> Any:
         response = self._client().get(self._url(path), headers=self._installation_headers(), timeout=self.timeout_seconds)

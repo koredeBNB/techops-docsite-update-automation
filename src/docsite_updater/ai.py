@@ -133,6 +133,8 @@ Rules:
 - Use repo_role "docsite" for MkDocs documentation updates.
 - Use repo_role "playground" for interactive playground updates.
 - Playground updates may touch any relevant existing text/code file from the provided playground repository files, but must be small, source-diff-supported, and directly related.
+- If the source diff adds a new public API, and playground repository files are provided, create or update a minimal playground experience for that API. Do not skip playground updates merely because no playground for that API exists yet.
+- For new playgrounds, follow the existing app structure and keep the change minimal: static client-side data, a simple snippet/response UI, and no new backend.
 - Do not update workflows, secrets, generated build output, binary assets, lockfiles, or dependency files unless the source diff explicitly requires it.
 - Output only valid JSON with this schema:
 {
@@ -252,6 +254,8 @@ def _doc_update_from_payload(item: Any) -> DocUpdate:
         confidence_value = float(confidence)
     except (TypeError, ValueError) as exc:
         raise InvalidAIOutputError("Each update confidence must be numeric") from exc
+    if confidence_value > 1 and confidence_value <= 100:
+        confidence_value = confidence_value / 100
     if confidence_value < 0 or confidence_value > 1:
         raise InvalidAIOutputError("Each update confidence must be between 0 and 1")
     return DocUpdate(

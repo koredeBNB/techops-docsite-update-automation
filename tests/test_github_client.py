@@ -239,6 +239,45 @@ def test_github_app_client_lists_docs_commits_and_opens_pr(monkeypatch: pytest.M
     assert pr.url == "https://github.com/koredeBNB/mock-mkdocs-repo/pull/3"
 
 
+def test_github_app_client_can_create_new_files(monkeypatch: pytest.MonkeyPatch) -> None:
+    seen: dict[str, object] = {"put_payload": None}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "POST" and request.url.path == "/app/installations/42/access_tokens":
+            return httpx.Response(201, json={"token": "installation-token"})
+        if request.method == "GET" and request.url.path == "/repos/koredeBNB/mock-mkdocs-repo":
+            return httpx.Response(200, json={"default_branch": "main"})
+        if request.method == "GET" and request.url.path == "/repos/koredeBNB/mock-mkdocs-repo/git/ref/heads/main":
+            return httpx.Response(200, json={"object": {"sha": "branch-sha"}})
+        if request.method == "POST" and request.url.path == "/repos/koredeBNB/mock-mkdocs-repo/git/refs":
+            return httpx.Response(201, json={"ref": "refs/heads/ai-docs/test"})
+        if request.method == "GET" and request.url.path == "/repos/koredeBNB/mock-mkdocs-repo/contents/docs/gas-fees.md":
+            return httpx.Response(404, json={"message": "Not Found"})
+        if request.method == "PUT" and request.url.path == "/repos/koredeBNB/mock-mkdocs-repo/contents/docs/gas-fees.md":
+            seen["put_payload"] = json.loads(request.content)
+            return httpx.Response(201, json={"content": {"sha": "new-file-sha"}})
+        return httpx.Response(404, json={"message": f"not found: {request.method} {request.url.path}"})
+
+    client = GitHubAppClient(
+        app_id="123",
+        private_key="private",
+        docsite_repo="koredeBNB/mock-mkdocs-repo",
+        client=httpx.Client(transport=httpx.MockTransport(handler)),
+    )
+    monkeypatch.setattr(client, "_app_jwt", lambda: "app-jwt")
+    client.create_installation_token(42)
+
+    client.create_docsite_branch("ai-docs/test")
+    changed = client.commit_doc_updates(
+        "ai-docs/test",
+        [DocUpdate(path="docs/gas-fees.md", content="# Gas Fees\n", rationale="New gas fees docs")],
+    )
+
+    assert changed == ["docs/gas-fees.md"]
+    assert seen["put_payload"]["branch"] == "ai-docs/test"
+    assert "sha" not in seen["put_payload"]
+
+
 def test_github_app_client_lists_playground_files(monkeypatch: pytest.MonkeyPatch) -> None:
     ts_content = "export const response = {}\n"
     encoded_ts = base64.b64encode(ts_content.encode("utf-8")).decode("ascii")
