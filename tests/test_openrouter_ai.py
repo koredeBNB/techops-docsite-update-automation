@@ -113,6 +113,82 @@ def test_openrouter_client_posts_strict_json_request_and_parses_updates() -> Non
     assert result.usage.input_tokens == 100
 
 
+def test_openrouter_client_parses_playground_updates() -> None:
+    def handler(_: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "choices": [
+                    {
+                        "message": {
+                            "content": json.dumps(
+                                {
+                                    "status": "updates",
+                                    "summary": "Updated playground fixture.",
+                                    "updates": [
+                                        {
+                                            "repo_role": "playground",
+                                            "path": "src/validatorStatus.ts",
+                                            "content": "export const response = { reward_rate: 0.12 }\n",
+                                            "rationale": "The playground mirrors the validator response.",
+                                            "confidence": 0.91,
+                                        }
+                                    ],
+                                }
+                            )
+                        }
+                    }
+                ]
+            },
+        )
+
+    client = OpenRouterAIClient(api_key="or-key", client=httpx.Client(transport=httpx.MockTransport(handler)))
+
+    result = client.propose_doc_updates(
+        make_pr_context(),
+        [DocFile(path="src/validatorStatus.ts", content="export const response = {}\n", repo_role="playground")],
+    )
+
+    assert result.status == "updates"
+    assert result.updates[0].repo_role == "playground"
+    assert result.updates[0].path == "src/validatorStatus.ts"
+
+
+def test_openrouter_client_rejects_unsafe_playground_paths() -> None:
+    def handler(_: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "choices": [
+                    {
+                        "message": {
+                            "content": json.dumps(
+                                {
+                                    "status": "updates",
+                                    "summary": "Unsafe update.",
+                                    "updates": [
+                                        {
+                                            "repo_role": "playground",
+                                            "path": ".github/workflows/deploy.yml",
+                                            "content": "name: unsafe\n",
+                                            "rationale": "Should not be allowed.",
+                                            "confidence": 0.8,
+                                        }
+                                    ],
+                                }
+                            )
+                        }
+                    }
+                ]
+            },
+        )
+
+    client = OpenRouterAIClient(api_key="or-key", client=httpx.Client(transport=httpx.MockTransport(handler)))
+
+    with pytest.raises(InvalidAIOutputError):
+        client.propose_doc_updates(make_pr_context(), [])
+
+
 def test_openrouter_client_returns_no_changes_needed() -> None:
     def handler(_: httpx.Request) -> httpx.Response:
         return httpx.Response(

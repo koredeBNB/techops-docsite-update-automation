@@ -73,6 +73,34 @@ def test_creates_branch_commits_changes_and_opens_pr() -> None:
     assert pr.changed_files == ["docs/api.md"]
 
 
+def test_in_memory_client_lists_and_updates_playground_files() -> None:
+    github = InMemoryGitHubClient(
+        docsite_repo="koredeBNB/mock-mkdocs-repo",
+        playground_repo="koredeBNB/techops-docsite-interactive-playground",
+        playground_files={
+            "src/validatorStatus.ts": "export const response = {}\n",
+            "dist/assets/index.js": "generated",
+            ".github/workflows/deploy.yml": "name: deploy",
+        },
+    )
+
+    files = github.list_playground_files()
+    update = DocUpdate(
+        path="src/validatorStatus.ts",
+        content="export const response = { reward_rate: 0.12 }\n",
+        rationale="Playground mirrors API response.",
+        repo_role="playground",
+    )
+    github.create_repository_branch("playground", "ai-playground/test")
+    changed_files = github.commit_repository_updates("playground", "ai-playground/test", [update])
+    pr = github.open_repository_pr("playground", "ai-playground/test", "Update playground", "Body", changed_files)
+
+    assert [file.path for file in files] == ["src/validatorStatus.ts"]
+    assert github.playground_files["src/validatorStatus.ts"] == "export const response = { reward_rate: 0.12 }\n"
+    assert pr.url == "https://github.com/koredeBNB/techops-docsite-interactive-playground/pull/1"
+    assert pr.repo_role == "playground"
+
+
 def test_request_reviewers_records_reviewers() -> None:
     github = make_github()
 
@@ -95,6 +123,7 @@ def test_factory_selects_real_github_app_client() -> None:
         github_private_key="private",
         github_webhook_secret="webhook",
         docsite_repo="koredeBNB/mock-mkdocs-repo",
+        playground_repo="koredeBNB/techops-docsite-interactive-playground",
         ai_api_key="ai-key",
         github_client="app",
     )
@@ -103,6 +132,7 @@ def test_factory_selects_real_github_app_client() -> None:
 
     assert isinstance(client, GitHubAppClient)
     assert client.docsite_repo == "koredeBNB/mock-mkdocs-repo"
+    assert client.playground_repo == "koredeBNB/techops-docsite-interactive-playground"
 
 
 def test_github_app_client_default_http_client_ignores_proxy_env() -> None:
@@ -207,3 +237,44 @@ def test_github_app_client_lists_docs_commits_and_opens_pr(monkeypatch: pytest.M
     assert seen["pull_payload"] == {"title": "Update docs", "body": "Body", "head": "ai-docs/test", "base": "main"}
     assert seen["review_payload"] == {"reviewers": ["koredeBNB"]}
     assert pr.url == "https://github.com/koredeBNB/mock-mkdocs-repo/pull/3"
+
+
+def test_github_app_client_lists_playground_files(monkeypatch: pytest.MonkeyPatch) -> None:
+    ts_content = "export const response = {}\n"
+    encoded_ts = base64.b64encode(ts_content.encode("utf-8")).decode("ascii")
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "POST" and request.url.path == "/app/installations/42/access_tokens":
+            return httpx.Response(201, json={"token": "installation-token"})
+        if request.method == "GET" and request.url.path == "/repos/koredeBNB/techops-docsite-interactive-playground":
+            return httpx.Response(200, json={"default_branch": "main"})
+        if request.method == "GET" and request.url.path == "/repos/koredeBNB/techops-docsite-interactive-playground/git/trees/main":
+            return httpx.Response(
+                200,
+                json={
+                    "tree": [
+                        {"type": "blob", "path": "src/validatorStatus.ts"},
+                        {"type": "blob", "path": "dist/assets/index.js"},
+                    ]
+                },
+            )
+        if request.method == "GET" and request.url.path == "/repos/koredeBNB/techops-docsite-interactive-playground/contents/src/validatorStatus.ts":
+            return httpx.Response(200, json={"content": encoded_ts, "sha": "file-sha"})
+        return httpx.Response(404, json={"message": f"not found: {request.method} {request.url.path}"})
+
+    client = GitHubAppClient(
+        app_id="123",
+        private_key="private",
+        docsite_repo="koredeBNB/mock-mkdocs-repo",
+        playground_repo="koredeBNB/techops-docsite-interactive-playground",
+        client=httpx.Client(transport=httpx.MockTransport(handler)),
+    )
+    monkeypatch.setattr(client, "_app_jwt", lambda: "app-jwt")
+    client.create_installation_token(42)
+
+    files = client.list_playground_files()
+
+    assert len(files) == 1
+    assert files[0].repo_role == "playground"
+    assert files[0].path == "src/validatorStatus.ts"
+    assert files[0].content == ts_content

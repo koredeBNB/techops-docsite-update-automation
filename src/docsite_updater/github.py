@@ -8,7 +8,7 @@ from typing import Any
 import httpx
 import jwt
 
-from .models import ChangedFile, CreatedPullRequest, DocFile, DocUpdate, DocUpdateJob, PullRequestContext
+from .models import ChangedFile, CreatedPullRequest, DocFile, DocUpdate, DocUpdateJob, PullRequestContext, RepoRole
 
 
 class UnauthorizedRepositoryError(Exception):
@@ -32,8 +32,10 @@ class SourcePullRequestFixture:
 @dataclass
 class InMemoryGitHubClient:
     docsite_repo: str
+    playground_repo: str = ""
     source_prs: dict[str, SourcePullRequestFixture] = field(default_factory=dict)
     doc_files: dict[str, str] = field(default_factory=dict)
+    playground_files: dict[str, str] = field(default_factory=dict)
     branches: set[str] = field(default_factory=set)
     pull_requests: list[CreatedPullRequest] = field(default_factory=list)
     requested_reviewers: dict[int, list[str]] = field(default_factory=dict)
@@ -41,8 +43,10 @@ class InMemoryGitHubClient:
     allowed_write_repo: str | None = None
 
     def __post_init__(self) -> None:
-        if self.allowed_write_repo is None:
-            self.allowed_write_repo = self.docsite_repo
+        # By default the in-memory client can write to the configured target
+        # repositories. Tests can set allowed_write_repo to simulate a
+        # restricted GitHub App installation.
+        pass
 
     def create_installation_token(self, installation_id: int) -> str:
         self.installation_tokens.append(installation_id)
@@ -60,41 +64,90 @@ class InMemoryGitHubClient:
         )
 
     def list_doc_files(self) -> list[DocFile]:
-        return [DocFile(path=path, content=content) for path, content in sorted(self.doc_files.items())]
+        return [DocFile(path=path, content=content, repo_role="docsite") for path, content in sorted(self.doc_files.items())]
+
+    def list_playground_files(self) -> list[DocFile]:
+        if not self.playground_repo:
+            return []
+        return [
+            DocFile(path=path, content=content, repo_role="playground")
+            for path, content in sorted(self.playground_files.items())
+            if _is_playground_file(path)
+        ]
 
     def create_docsite_branch(self, branch_name: str) -> None:
-        self._assert_can_write_docsite()
-        self.branches.add(branch_name)
+        self.create_repository_branch("docsite", branch_name)
 
     def commit_doc_updates(self, branch_name: str, updates: list[DocUpdate]) -> list[str]:
-        self._assert_can_write_docsite()
-        if branch_name not in self.branches:
+        return self.commit_repository_updates("docsite", branch_name, updates)
+
+    def open_docsite_pr(self, branch_name: str, title: str, body: str, changed_files: list[str]) -> CreatedPullRequest:
+        return self.open_repository_pr("docsite", branch_name, title, body, changed_files)
+
+    def request_reviewers(self, pr_number: int, reviewers: list[str]) -> None:
+        self.request_repository_reviewers("docsite", pr_number, reviewers)
+
+    def create_repository_branch(self, repo_role: RepoRole, branch_name: str) -> None:
+        self._assert_can_write_repo(repo_role)
+        self.branches.add(self._branch_key(repo_role, branch_name))
+
+    def commit_repository_updates(self, repo_role: RepoRole, branch_name: str, updates: list[DocUpdate]) -> list[str]:
+        self._assert_can_write_repo(repo_role)
+        if self._branch_key(repo_role, branch_name) not in self.branches:
             raise ValueError(f"Branch does not exist: {branch_name}")
+        files = self._files_for_role(repo_role)
         changed: list[str] = []
         for update in updates:
-            previous = self.doc_files.get(update.path)
+            previous = files.get(update.path)
             if previous != update.content:
-                self.doc_files[update.path] = update.content
+                files[update.path] = update.content
                 changed.append(update.path)
         return changed
 
-    def open_docsite_pr(self, branch_name: str, title: str, body: str, changed_files: list[str]) -> CreatedPullRequest:
-        self._assert_can_write_docsite()
+    def open_repository_pr(
+        self,
+        repo_role: RepoRole,
+        branch_name: str,
+        title: str,
+        body: str,
+        changed_files: list[str],
+    ) -> CreatedPullRequest:
+        self._assert_can_write_repo(repo_role)
+        repo = self._repo_for_role(repo_role)
         pr = CreatedPullRequest(
-            url=f"https://github.com/{self.docsite_repo}/pull/{len(self.pull_requests) + 1}",
+            url=f"https://github.com/{repo}/pull/{len(self.pull_requests) + 1}",
             number=len(self.pull_requests) + 1,
             branch=branch_name,
             changed_files=changed_files,
+            repo_role=repo_role,
+            repo=repo,
         )
         self.pull_requests.append(pr)
         return pr
 
-    def request_reviewers(self, pr_number: int, reviewers: list[str]) -> None:
+    def request_repository_reviewers(self, repo_role: RepoRole, pr_number: int, reviewers: list[str]) -> None:
+        self._assert_can_write_repo(repo_role)
         self.requested_reviewers[pr_number] = reviewers
 
     def _assert_can_write_docsite(self) -> None:
-        if self.allowed_write_repo != self.docsite_repo:
-            raise UnauthorizedRepositoryError("Writes are restricted to the configured docsite repository")
+        self._assert_can_write_repo("docsite")
+
+    def _assert_can_write_repo(self, repo_role: RepoRole) -> None:
+        repo = self._repo_for_role(repo_role)
+        if not repo:
+            raise UnauthorizedRepositoryError(f"{repo_role} repository is not configured")
+        if self.allowed_write_repo is not None and self.allowed_write_repo != repo:
+            raise UnauthorizedRepositoryError(f"Writes are restricted to the configured {repo_role} repository")
+
+    def _repo_for_role(self, repo_role: RepoRole) -> str:
+        return self.docsite_repo if repo_role == "docsite" else self.playground_repo
+
+    def _files_for_role(self, repo_role: RepoRole) -> dict[str, str]:
+        return self.doc_files if repo_role == "docsite" else self.playground_files
+
+    @staticmethod
+    def _branch_key(repo_role: RepoRole, branch_name: str) -> str:
+        return branch_name if repo_role == "docsite" else f"{repo_role}:{branch_name}"
 
 
 @dataclass
@@ -102,6 +155,7 @@ class GitHubAppClient:
     app_id: str
     private_key: str
     docsite_repo: str
+    playground_repo: str = ""
     api_base_url: str = "https://api.github.com"
     timeout_seconds: float = 10.0
     default_branch: str = "main"
@@ -109,7 +163,7 @@ class GitHubAppClient:
 
     def __post_init__(self) -> None:
         self._installation_token: str | None = None
-        self._docsite_default_branch: str | None = None
+        self._default_branches: dict[str, str] = {}
 
     def create_installation_token(self, installation_id: int) -> str:
         response = self._client().post(
@@ -149,26 +203,23 @@ class GitHubAppClient:
         )
 
     def list_doc_files(self) -> list[DocFile]:
-        owner, repo = _split_repo(self.docsite_repo)
-        branch = self._docsite_branch()
-        tree = self._get_json(f"/repos/{owner}/{repo}/git/trees/{branch}?recursive=1").get("tree", [])
-        docs: list[DocFile] = []
-        for item in tree:
-            path = item.get("path")
-            if item.get("type") != "blob" or not isinstance(path, str):
-                continue
-            if not _is_doc_file(path):
-                continue
-            docs.append(DocFile(path=path, content=self._get_file_content(owner=owner, repo=repo, path=path, ref=branch)[0]))
-        return docs
+        return self._list_repository_files("docsite")
+
+    def list_playground_files(self) -> list[DocFile]:
+        if not self.playground_repo:
+            return []
+        return self._list_repository_files("playground")
 
     def create_docsite_branch(self, branch_name: str) -> None:
-        owner, repo = _split_repo(self.docsite_repo)
-        branch = self._docsite_branch()
+        self.create_repository_branch("docsite", branch_name)
+
+    def create_repository_branch(self, repo_role: RepoRole, branch_name: str) -> None:
+        owner, repo = _split_repo(self._repo_for_role(repo_role))
+        branch = self._default_branch_for_repo(repo_role)
         ref = self._get_json(f"/repos/{owner}/{repo}/git/ref/heads/{branch}")
         sha = ((ref.get("object") or {}).get("sha"))
         if not sha:
-            raise GitHubClientError("Could not resolve docsite default branch SHA")
+            raise GitHubClientError(f"Could not resolve {repo_role} default branch SHA")
         response = self._client().post(
             self._url(f"/repos/{owner}/{repo}/git/refs"),
             headers=self._installation_headers(),
@@ -180,7 +231,10 @@ class GitHubAppClient:
         response.raise_for_status()
 
     def commit_doc_updates(self, branch_name: str, updates: list[DocUpdate]) -> list[str]:
-        owner, repo = _split_repo(self.docsite_repo)
+        return self.commit_repository_updates("docsite", branch_name, updates)
+
+    def commit_repository_updates(self, repo_role: RepoRole, branch_name: str, updates: list[DocUpdate]) -> list[str]:
+        owner, repo = _split_repo(self._repo_for_role(repo_role))
         changed_files: list[str] = []
         for update in updates:
             current_content, sha = self._get_file_content(owner=owner, repo=repo, path=update.path, ref=branch_name)
@@ -203,11 +257,22 @@ class GitHubAppClient:
         return changed_files
 
     def open_docsite_pr(self, branch_name: str, title: str, body: str, changed_files: list[str]) -> CreatedPullRequest:
-        owner, repo = _split_repo(self.docsite_repo)
+        return self.open_repository_pr("docsite", branch_name, title, body, changed_files)
+
+    def open_repository_pr(
+        self,
+        repo_role: RepoRole,
+        branch_name: str,
+        title: str,
+        body: str,
+        changed_files: list[str],
+    ) -> CreatedPullRequest:
+        repo_full_name = self._repo_for_role(repo_role)
+        owner, repo = _split_repo(repo_full_name)
         response = self._client().post(
             self._url(f"/repos/{owner}/{repo}/pulls"),
             headers=self._installation_headers(),
-            json={"title": title, "body": body, "head": branch_name, "base": self._docsite_branch()},
+            json={"title": title, "body": body, "head": branch_name, "base": self._default_branch_for_repo(repo_role)},
             timeout=self.timeout_seconds,
         )
         response.raise_for_status()
@@ -217,12 +282,17 @@ class GitHubAppClient:
             number=int(payload.get("number")),
             branch=branch_name,
             changed_files=changed_files,
+            repo_role=repo_role,
+            repo=repo_full_name,
         )
 
     def request_reviewers(self, pr_number: int, reviewers: list[str]) -> None:
+        self.request_repository_reviewers("docsite", pr_number, reviewers)
+
+    def request_repository_reviewers(self, repo_role: RepoRole, pr_number: int, reviewers: list[str]) -> None:
         if not reviewers:
             return
-        owner, repo = _split_repo(self.docsite_repo)
+        owner, repo = _split_repo(self._repo_for_role(repo_role))
         response = self._client().post(
             self._url(f"/repos/{owner}/{repo}/pulls/{pr_number}/requested_reviewers"),
             headers=self._installation_headers(),
@@ -232,12 +302,44 @@ class GitHubAppClient:
         response.raise_for_status()
 
     def _docsite_branch(self) -> str:
-        if self._docsite_default_branch:
-            return self._docsite_default_branch
-        owner, repo = _split_repo(self.docsite_repo)
+        return self._default_branch_for_repo("docsite")
+
+    def _default_branch_for_repo(self, repo_role: RepoRole) -> str:
+        repo_full_name = self._repo_for_role(repo_role)
+        if repo_full_name in self._default_branches:
+            return self._default_branches[repo_full_name]
+        owner, repo = _split_repo(repo_full_name)
         repo_payload = self._get_json(f"/repos/{owner}/{repo}")
-        self._docsite_default_branch = str(repo_payload.get("default_branch") or self.default_branch)
-        return self._docsite_default_branch
+        branch = str(repo_payload.get("default_branch") or self.default_branch)
+        self._default_branches[repo_full_name] = branch
+        return branch
+
+    def _list_repository_files(self, repo_role: RepoRole) -> list[DocFile]:
+        repo_full_name = self._repo_for_role(repo_role)
+        owner, repo = _split_repo(repo_full_name)
+        branch = self._default_branch_for_repo(repo_role)
+        tree = self._get_json(f"/repos/{owner}/{repo}/git/trees/{branch}?recursive=1").get("tree", [])
+        files: list[DocFile] = []
+        for item in tree:
+            path = item.get("path")
+            if item.get("type") != "blob" or not isinstance(path, str):
+                continue
+            if repo_role == "docsite" and not _is_doc_file(path):
+                continue
+            if repo_role == "playground" and not _is_playground_file(path):
+                continue
+            try:
+                content = self._get_file_content(owner=owner, repo=repo, path=path, ref=branch)[0]
+            except UnicodeDecodeError:
+                continue
+            files.append(DocFile(path=path, content=content, repo_role=repo_role))
+        return files
+
+    def _repo_for_role(self, repo_role: RepoRole) -> str:
+        repo = self.docsite_repo if repo_role == "docsite" else self.playground_repo
+        if not repo:
+            raise GitHubClientError(f"{repo_role} repository is not configured")
+        return repo
 
     def _get_file_content(self, *, owner: str, repo: str, path: str, ref: str) -> tuple[str, str]:
         payload = self._get_json(f"/repos/{owner}/{repo}/contents/{path}?ref={ref}")
@@ -289,10 +391,11 @@ def create_github_client(settings) -> InMemoryGitHubClient | GitHubAppClient:
             app_id=settings.github_app_id,
             private_key=settings.github_private_key,
             docsite_repo=settings.docsite_repo,
+            playground_repo=settings.playground_repo,
             api_base_url=settings.github_api_base_url,
             timeout_seconds=settings.external_timeout_seconds,
         )
-    return InMemoryGitHubClient(docsite_repo=settings.docsite_repo)
+    return InMemoryGitHubClient(docsite_repo=settings.docsite_repo, playground_repo=settings.playground_repo)
 
 
 def _split_repo(full_name: str) -> tuple[str, str]:
@@ -304,3 +407,27 @@ def _split_repo(full_name: str) -> tuple[str, str]:
 
 def _is_doc_file(path: str) -> bool:
     return path.startswith("docs/") and path.lower().endswith((".md", ".mdx", ".rst", ".txt", ".adoc"))
+
+
+def _is_playground_file(path: str) -> bool:
+    lowered = path.lower()
+    parts = lowered.split("/")
+    if any(part in {".git", "node_modules", "dist", "build", "coverage"} for part in parts):
+        return False
+    if lowered.startswith((".env", ".github/")) or "/.env" in lowered:
+        return False
+    if lowered.endswith((".png", ".jpg", ".jpeg", ".gif", ".webp", ".ico", ".pdf", ".zip", ".gz", ".lock")):
+        return False
+    return lowered.endswith((
+        ".ts",
+        ".tsx",
+        ".js",
+        ".jsx",
+        ".json",
+        ".md",
+        ".css",
+        ".html",
+        ".yml",
+        ".yaml",
+        ".svg",
+    ))

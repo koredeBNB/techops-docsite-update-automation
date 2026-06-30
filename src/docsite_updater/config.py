@@ -14,6 +14,7 @@ class Settings:
     github_webhook_secret: str
     docsite_repo: str
     ai_api_key: str
+    playground_repo: str = ""
     github_client: str = "memory"
     github_api_base_url: str = "https://api.github.com"
     ai_provider: str = "mock"
@@ -35,6 +36,7 @@ class Settings:
             github_client=os.environ.get("GITHUB_CLIENT", "memory"),
             github_api_base_url=os.environ.get("GITHUB_API_BASE_URL", "https://api.github.com"),
             docsite_repo=os.environ.get("DOCSITE_REPO", "bnb-chain/mock-bnb-docsite"),
+            playground_repo=os.environ.get("PLAYGROUND_REPO", ""),
             ai_api_key=os.environ.get("AI_API_KEY", "dev-ai-key"),
             ai_provider=os.environ.get("AI_PROVIDER", "mock"),
             openrouter_api_key=os.environ.get("OPENROUTER_API_KEY", ""),

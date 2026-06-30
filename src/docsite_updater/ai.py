@@ -7,7 +7,7 @@ from typing import Any
 import httpx
 
 from .config import Settings
-from .models import AIUpdateResult, AIUsage, DocFile, DocUpdate, PullRequestContext
+from .models import AIUpdateResult, AIUsage, DocFile, DocUpdate, PullRequestContext, RepoRole
 
 
 class InvalidAIOutputError(Exception):
@@ -40,12 +40,14 @@ class RuleBasedAIClient:
         lower_diff = pr_context.diff.lower()
         for doc in docs:
             if "api" in lower_diff and ("api" in doc.path.lower() or "api" in doc.content.lower()):
+                section = "Automated Playground Update" if doc.repo_role == "playground" else "Automated Update"
                 updates.append(
                     DocUpdate(
                         path=doc.path,
-                        content=f"{doc.content.rstrip()}\n\n## Automated Update\n\nUpdated based on {pr_context.source_repo} PR #{pr_context.pr_number}.\n",
+                        content=f"{doc.content.rstrip()}\n\n## {section}\n\nUpdated based on {pr_context.source_repo} PR #{pr_context.pr_number}.\n",
                         rationale="API-related source changes affect this documentation page.",
                         confidence=0.4 if self.low_confidence else 0.92,
+                        repo_role=doc.repo_role,
                     )
                 )
 
@@ -118,22 +120,27 @@ def create_ai_client(settings: Settings):
 
 
 def system_prompt() -> str:
-    return """You update MkDocs documentation from source code diffs.
+    return """You update documentation and interactive playground files from source code diffs.
 
 Rules:
-- Be conservative. Only update docs directly affected by the source diff.
-- Preserve the existing documentation style.
-- Return no_changes_needed when docs do not need changes.
+- Be conservative. Only update files directly affected by the source diff.
+- Preserve the existing style of each target repository.
+- Return no_changes_needed when no docs or playground files need changes.
 - Return low_confidence if the update is plausible but uncertain.
 - Never invent APIs, fields, behavior, or examples not supported by the diff.
 - Do not modify existing documented values, examples, numbers, defaults, or claims unless the source diff explicitly changes them.
 - When adding a new response field, add only that new field and keep all existing example values exactly unchanged.
+- Use repo_role "docsite" for MkDocs documentation updates.
+- Use repo_role "playground" for interactive playground updates.
+- Playground updates may touch any relevant existing text/code file from the provided playground repository files, but must be small, source-diff-supported, and directly related.
+- Do not update workflows, secrets, generated build output, binary assets, lockfiles, or dependency files unless the source diff explicitly requires it.
 - Output only valid JSON with this schema:
 {
   "status": "updates | no_changes_needed | low_confidence",
   "summary": "short explanation",
   "updates": [
     {
+      "repo_role": "docsite | playground",
       "path": "docs/example.md",
       "content": "full updated markdown content",
       "rationale": "why this file changed",
@@ -146,7 +153,7 @@ Rules:
 
 def user_prompt(pr_context: PullRequestContext, docs: list[DocFile]) -> str:
     changed_files = "\n".join(f"- {item.path} ({item.status})" for item in pr_context.changed_files)
-    docs_payload = "\n\n".join(f"--- FILE: {doc.path} ---\n{doc.content}" for doc in docs)
+    files_payload = "\n\n".join(f"--- FILE: {doc.repo_role}:{doc.path} ---\n{doc.content}" for doc in docs)
     return f"""Source repository: {pr_context.source_repo}
 Source PR: #{pr_context.pr_number}
 Source PR URL: {pr_context.source_pr_url}
@@ -161,7 +168,7 @@ Source diff:
 ```
 
 Documentation files:
-{docs_payload}
+{files_payload}
 """
 
 
@@ -227,8 +234,16 @@ def _doc_update_from_payload(item: Any) -> DocUpdate:
     content = item.get("content")
     rationale = item.get("rationale")
     confidence = item.get("confidence", 0.0)
-    if not isinstance(path, str) or not path.startswith("docs/"):
-        raise InvalidAIOutputError("Each update path must be a docs/ path")
+    repo_role = item.get("repo_role", "docsite")
+    if repo_role not in {"docsite", "playground"}:
+        raise InvalidAIOutputError("Each update repo_role must be docsite or playground")
+    typed_repo_role = repo_role  # helps older type checkers narrow below
+    if not isinstance(path, str):
+        raise InvalidAIOutputError("Each update path must be a string")
+    if typed_repo_role == "docsite" and not path.startswith("docs/"):
+        raise InvalidAIOutputError("Docsite update paths must be docs/ paths")
+    if typed_repo_role == "playground" and not _is_safe_playground_update_path(path):
+        raise InvalidAIOutputError("Playground update path is not safe to edit")
     if not isinstance(content, str) or not content.strip():
         raise InvalidAIOutputError("Each update content must be non-empty")
     if not isinstance(rationale, str) or not rationale.strip():
@@ -239,4 +254,24 @@ def _doc_update_from_payload(item: Any) -> DocUpdate:
         raise InvalidAIOutputError("Each update confidence must be numeric") from exc
     if confidence_value < 0 or confidence_value > 1:
         raise InvalidAIOutputError("Each update confidence must be between 0 and 1")
-    return DocUpdate(path=path, content=content, rationale=rationale, confidence=confidence_value)
+    return DocUpdate(
+        path=path,
+        content=content,
+        rationale=rationale,
+        confidence=confidence_value,
+        repo_role=typed_repo_role,
+    )
+
+
+def _is_safe_playground_update_path(path: str) -> bool:
+    lowered = path.lower()
+    parts = lowered.split("/")
+    if path.startswith("/") or ".." in parts:
+        return False
+    if any(part in {".git", "node_modules", "dist", "build", "coverage"} for part in parts):
+        return False
+    if lowered.startswith((".env", ".github/")) or "/.env" in lowered:
+        return False
+    if lowered.endswith((".png", ".jpg", ".jpeg", ".gif", ".webp", ".ico", ".pdf", ".zip", ".gz", ".lock")):
+        return False
+    return True

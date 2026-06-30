@@ -89,6 +89,83 @@ def test_worker_creates_docsite_pr_for_relevant_api_change() -> None:
     assert metrics.counters["docs_pr.created"] == 1
 
 
+def test_worker_creates_docsite_and_playground_prs_for_source_api_change() -> None:
+    settings = Settings(
+        github_app_id="123",
+        github_private_key="private",
+        github_webhook_secret="webhook",
+        docsite_repo="koredeBNB/mock-mkdocs-repo",
+        playground_repo="koredeBNB/techops-docsite-interactive-playground",
+        ai_api_key="ai-key",
+        reviewer_logins=("docs-reviewer",),
+    )
+    job = DocUpdateJob(
+        source_repo="koredeBNB/mock-bsc-app",
+        pr_number=7,
+        merge_commit_sha="abc123def4567890",
+        default_branch="main",
+        installation_id=42,
+        source_pr_url="https://github.com/koredeBNB/mock-bsc-app/pull/7",
+        correlation_id="request-1",
+    )
+    github = InMemoryGitHubClient(
+        docsite_repo=settings.docsite_repo,
+        playground_repo=settings.playground_repo,
+        source_prs={
+            job.identity: SourcePullRequestFixture(
+                repo=job.source_repo,
+                number=job.pr_number,
+                merge_commit_sha=job.merge_commit_sha,
+                url=job.source_pr_url,
+                diff='+        "reward_rate": 0.12,',
+                changed_files=[ChangedFile(path="src/mock_bsc_app/validators.py", status="modified")],
+            )
+        },
+        doc_files={"docs/validators.md": "# Validators\n\nOld docs."},
+        playground_files={"src/validatorStatus.ts": "export const response = { validator_id: 'validator-1' }\n"},
+    )
+    worker = DocUpdateWorker(
+        settings=settings,
+        github=github,
+        ai=FixedAIClient(
+            AIUpdateResult(
+                status="updates",
+                summary="Update docs and playground for validator response fields.",
+                updates=[
+                    DocUpdate(
+                        path="docs/validators.md",
+                        content="# Validators\n\nDocuments reward_rate.",
+                        rationale="Docs must mention reward_rate.",
+                        confidence=0.95,
+                        repo_role="docsite",
+                    ),
+                    DocUpdate(
+                        path="src/validatorStatus.ts",
+                        content="export const response = { validator_id: 'validator-1', reward_rate: 0.12 }\n",
+                        rationale="Playground response mirrors get_validator_status.",
+                        confidence=0.95,
+                        repo_role="playground",
+                    ),
+                ],
+                usage=AIUsage(model="test", prompt_version="test"),
+            )
+        ),
+        validator=MockMkDocsValidator(),
+        logger=MemoryLogger(),
+        metrics=MemoryMetrics(),
+    )
+
+    result = worker.run(job)
+
+    assert result.status == "created_pr"
+    assert len(result.prs) == 2
+    assert [pr.repo_role for pr in result.prs] == ["docsite", "playground"]
+    assert github.doc_files["docs/validators.md"] == "# Validators\n\nDocuments reward_rate."
+    assert github.playground_files["src/validatorStatus.ts"] == "export const response = { validator_id: 'validator-1', reward_rate: 0.12 }\n"
+    assert result.prs[0].url == "https://github.com/koredeBNB/mock-mkdocs-repo/pull/1"
+    assert result.prs[1].url == "https://github.com/koredeBNB/techops-docsite-interactive-playground/pull/2"
+
+
 def test_worker_rejects_ai_update_that_mutates_existing_numeric_value() -> None:
     settings = Settings(
         github_app_id="123",

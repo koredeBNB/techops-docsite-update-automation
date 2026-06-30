@@ -5,7 +5,19 @@ import time
 
 from .ai import InvalidAIOutputError
 from .config import Settings
-from .models import AIClient, DocFile, DocUpdate, DocUpdateJob, DocsiteValidator, GitHubClient, Logger, Metrics, WorkerResult
+from .models import (
+    AIClient,
+    CreatedPullRequest,
+    DocFile,
+    DocUpdate,
+    DocUpdateJob,
+    DocsiteValidator,
+    GitHubClient,
+    Logger,
+    Metrics,
+    RepoRole,
+    WorkerResult,
+)
 from .queue import PermanentJobError
 
 
@@ -41,10 +53,12 @@ class DocUpdateWorker:
             self.github.create_installation_token(job.installation_id)
             pr_context = self.github.fetch_pr_context(job)
             docs = self.github.list_doc_files()
+            playground_files = self.github.list_playground_files()
+            candidate_files = [*docs, *playground_files]
             self.metrics.observe("github.latency_ms", 1.0)
 
             ai_started = time.monotonic()
-            ai_result = self.ai.propose_doc_updates(pr_context, docs)
+            ai_result = self.ai.propose_doc_updates(pr_context, candidate_files)
             self.metrics.observe("ai.latency_ms", (time.monotonic() - ai_started) * 1000)
             self.logger.info(
                 "ai_result",
@@ -73,7 +87,11 @@ class DocUpdateWorker:
             self.logger.warning("worker_low_confidence", operation="doc_update_worker", status="low_confidence", **base_log_fields)
             return WorkerResult(status="low_confidence", message=ai_result.summary)
 
-        safety_result = validate_doc_update_safety(original_docs=docs, updates=ai_result.updates, source_diff=pr_context.diff)
+        safety_result = validate_doc_update_safety(
+            original_docs=candidate_files,
+            updates=ai_result.updates,
+            source_diff=pr_context.diff,
+        )
         if not safety_result.ok:
             self.metrics.increment("job.safety_rejected")
             self.logger.error(
@@ -85,7 +103,8 @@ class DocUpdateWorker:
             )
             return WorkerResult(status="safety_rejected", message=safety_result.reason)
 
-        validation = self.validator.validate(ai_result.updates)
+        updates_by_role = group_updates_by_role(ai_result.updates)
+        validation = self.validator.validate(updates_by_role["docsite"])
         if not validation.ok:
             self.metrics.increment("job.validation_failed")
             self.logger.error(
@@ -97,51 +116,108 @@ class DocUpdateWorker:
             )
             return WorkerResult(status="validation_failed", message=validation.output)
 
-        branch_name = f"ai-docs/{job.source_repo.replace('/', '-')}-{job.pr_number}-{job.merge_commit_sha[:8]}"
-        changed_files = [update.path for update in ai_result.updates]
-        pr_body = build_pr_body(job=job, summary=ai_result.summary, changed_files=changed_files)
+        playground_validation = self.validator.validate_playground(updates_by_role["playground"])
+        if not playground_validation.ok:
+            self.metrics.increment("job.validation_failed")
+            self.logger.error(
+                "playground_validation_failed",
+                operation="playground_build",
+                status="validation_failed",
+                validation_output=playground_validation.output,
+                **base_log_fields,
+            )
+            return WorkerResult(status="validation_failed", message=playground_validation.output)
 
-        self.github.create_docsite_branch(branch_name)
-        committed_files = self.github.commit_doc_updates(branch_name, ai_result.updates)
-        pr = self.github.open_docsite_pr(
-            branch_name,
-            title=f"[AI Docs] Update docs for {job.source_repo}#{job.pr_number}",
-            body=pr_body,
-            changed_files=committed_files,
-        )
-        if self.settings.reviewer_logins:
-            self.github.request_reviewers(pr.number, list(self.settings.reviewer_logins))
+        created_prs: list[CreatedPullRequest] = []
+        for repo_role in ("docsite", "playground"):
+            role_updates = updates_by_role[repo_role]
+            if not role_updates:
+                continue
+            pr = self._open_update_pr(
+                repo_role=repo_role,
+                job=job,
+                summary=ai_result.summary,
+                updates=role_updates,
+            )
+            if pr:
+                created_prs.append(pr)
 
-        self.metrics.increment("docs_pr.created")
+        if not created_prs:
+            self.metrics.increment("job.no_changes_needed")
+            self.logger.info("worker_completed", operation="doc_update_worker", status="no_changes_needed", **base_log_fields)
+            return WorkerResult(status="no_changes_needed", message="AI proposed no material file changes.")
+
+        self.metrics.increment("docs_pr.created", len([pr for pr in created_prs if pr.repo_role == "docsite"]))
+        self.metrics.increment("playground_pr.created", len([pr for pr in created_prs if pr.repo_role == "playground"]))
         self.logger.info(
             "worker_completed",
             operation="doc_update_worker",
             status="created_pr",
             duration=(time.monotonic() - started),
-            docsite_pr=pr.url,
+            pull_requests=[pr.url for pr in created_prs],
             **base_log_fields,
         )
-        return WorkerResult(status="created_pr", pr=pr, message=ai_result.summary)
+        return WorkerResult(status="created_pr", pr=created_prs[0], prs=created_prs, message=ai_result.summary)
+
+    def _open_update_pr(
+        self,
+        *,
+        repo_role: RepoRole,
+        job: DocUpdateJob,
+        summary: str,
+        updates: list[DocUpdate],
+    ) -> CreatedPullRequest | None:
+        branch_prefix = "ai-docs" if repo_role == "docsite" else "ai-playground"
+        branch_name = f"{branch_prefix}/{job.source_repo.replace('/', '-')}-{job.pr_number}-{job.merge_commit_sha[:8]}"
+        changed_files = [update.path for update in updates]
+        pr_body = build_pr_body(job=job, summary=summary, changed_files=changed_files, repo_role=repo_role)
+
+        self.github.create_repository_branch(repo_role, branch_name)
+        committed_files = self.github.commit_repository_updates(repo_role, branch_name, updates)
+        if not committed_files:
+            return None
+        title_subject = "docs" if repo_role == "docsite" else "playground"
+        pr = self.github.open_repository_pr(
+            repo_role,
+            branch_name,
+            title=f"[AI {title_subject.title()}] Update {title_subject} for {job.source_repo}#{job.pr_number}",
+            body=pr_body,
+            changed_files=committed_files,
+        )
+        if self.settings.reviewer_logins:
+            self.github.request_repository_reviewers(repo_role, pr.number, list(self.settings.reviewer_logins))
+        return pr
 
 
-def build_pr_body(*, job: DocUpdateJob, summary: str, changed_files: list[str]) -> str:
+def build_pr_body(*, job: DocUpdateJob, summary: str, changed_files: list[str], repo_role: RepoRole = "docsite") -> str:
     files = "\n".join(f"- `{path}`" for path in changed_files) or "- No files changed"
+    target = "MkDocs documentation" if repo_role == "docsite" else "interactive playground"
     return f"""## Summary
 {summary}
+
+## Target
+- {target}
 
 ## Source
 - Source repo: `{job.source_repo}`
 - Source PR: {job.source_pr_url}
 - Merge commit: `{job.merge_commit_sha}`
 
-## Changed Docs
+## Changed Files
 {files}
 
 ## Reviewer Checklist
-- [ ] Confirm the generated docs are technically accurate.
+- [ ] Confirm the generated updates are technically accurate.
 - [ ] Confirm examples and references match the source change.
 - [ ] Confirm this PR should be merged before publishing.
 """
+
+
+def group_updates_by_role(updates: list[DocUpdate]) -> dict[RepoRole, list[DocUpdate]]:
+    grouped: dict[RepoRole, list[DocUpdate]] = {"docsite": [], "playground": []}
+    for update in updates:
+        grouped[update.repo_role].append(update)
+    return grouped
 
 
 class SafetyResult:

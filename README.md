@@ -22,7 +22,7 @@ Optional OpenRouter settings:
 
 ```bash
 OPENROUTER_BASE_URL=https://openrouter.ai/api/v1
-OPENROUTER_HTTP_REFERER=https://github.com/bnb-chain/techops-docsite-update-automation
+OPENROUTER_HTTP_REFERER=https://github.com/koredeBNB/techops-docsite-update-automation
 OPENROUTER_APP_TITLE="AI Docsite Update Prototype"
 ```
 
@@ -50,6 +50,7 @@ GITHUB_APP_ID=your_github_app_id
 GITHUB_PRIVATE_KEY='-----BEGIN RSA PRIVATE KEY-----\n...\n-----END RSA PRIVATE KEY-----'
 GITHUB_WEBHOOK_SECRET=your_webhook_secret
 DOCSITE_REPO=koredeBNB/mock-mkdocs-repo
+PLAYGROUND_REPO=koredeBNB/techops-docsite-interactive-playground
 
 AI_PROVIDER=openrouter
 OPENROUTER_API_KEY=your_openrouter_key
@@ -82,6 +83,7 @@ Install the GitHub App on:
 
 - `koredeBNB/mock-bsc-app`
 - `koredeBNB/mock-mkdocs-repo`
+- `koredeBNB/techops-docsite-interactive-playground` (optional; enables playground update PRs)
 
 Required repository permissions:
 
