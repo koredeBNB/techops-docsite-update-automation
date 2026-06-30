@@ -16,6 +16,7 @@ To use OpenRouter with DeepSeek:
 AI_PROVIDER=openrouter
 OPENROUTER_API_KEY=your_openrouter_key
 OPENROUTER_MODEL=deepseek/deepseek-v3.2
+OPENROUTER_REVIEW_MODEL=deepseek/deepseek-v3.2
 ```
 
 Optional OpenRouter settings:
@@ -26,7 +27,7 @@ OPENROUTER_HTTP_REFERER=https://github.com/koredeBNB/techops-docsite-update-auto
 OPENROUTER_APP_TITLE="AI Docsite Update Prototype"
 ```
 
-The OpenRouter client requests strict JSON output and rejects invalid responses instead of creating documentation PRs.
+The OpenRouter client requests strict JSON output and rejects invalid responses instead of creating documentation PRs. After a generated PR is opened, the automation uses `OPENROUTER_REVIEW_MODEL` for a non-blocking secondary AI review comment on the PR.
 
 ## Test
 
@@ -54,7 +55,8 @@ PLAYGROUND_REPO=koredeBNB/techops-docsite-interactive-playground
 
 AI_PROVIDER=openrouter
 OPENROUTER_API_KEY=your_openrouter_key
-OPENROUTER_MODEL=deepseek/deepseek-v3.2
+OPENROUTER_MODEL=anthropic/claude-sonnet-4.6
+OPENROUTER_REVIEW_MODEL=deepseek/deepseek-v3.2
 ```
 
 Run the webhook server:

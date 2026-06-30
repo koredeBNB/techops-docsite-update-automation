@@ -20,6 +20,7 @@ class Settings:
     ai_provider: str = "mock"
     openrouter_api_key: str = ""
     openrouter_model: str = "deepseek/deepseek-v3.2"
+    openrouter_review_model: str = "deepseek/deepseek-v3.2"
     openrouter_base_url: str = "https://openrouter.ai/api/v1"
     openrouter_http_referer: str = "https://github.com/koredeBNB/automated-docsite-prototype"
     openrouter_app_title: str = "AI Docsite Update Prototype"
@@ -41,6 +42,7 @@ class Settings:
             ai_provider=os.environ.get("AI_PROVIDER", "mock"),
             openrouter_api_key=os.environ.get("OPENROUTER_API_KEY", ""),
             openrouter_model=os.environ.get("OPENROUTER_MODEL", "deepseek/deepseek-v3.2"),
+            openrouter_review_model=os.environ.get("OPENROUTER_REVIEW_MODEL", "deepseek/deepseek-v3.2"),
             openrouter_base_url=os.environ.get("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1"),
             openrouter_http_referer=os.environ.get("OPENROUTER_HTTP_REFERER", "https://github.com/koredeBNB/automated-docsite-prototype"),
             openrouter_app_title=os.environ.get("OPENROUTER_APP_TITLE", "AI Docsite Update Prototype"),

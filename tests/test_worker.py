@@ -5,7 +5,7 @@ import pytest
 from docsite_updater.ai import RuleBasedAIClient
 from docsite_updater.config import Settings
 from docsite_updater.github import InMemoryGitHubClient, SourcePullRequestFixture
-from docsite_updater.models import AIUpdateResult, AIUsage, ChangedFile, DocFile, DocUpdate, DocUpdateJob, PullRequestContext
+from docsite_updater.models import AIReviewResult, AIUpdateResult, AIUsage, ChangedFile, DocFile, DocUpdate, DocUpdateJob, PullRequestContext, RepoRole
 from docsite_updater.observability import MemoryLogger, MemoryMetrics
 from docsite_updater.queue import PermanentJobError
 from docsite_updater.validator import MockMkDocsValidator
@@ -62,6 +62,32 @@ class FixedAIClient:
         self.result = result
 
     def propose_doc_updates(self, pr_context: PullRequestContext, docs: list[DocFile]) -> AIUpdateResult:
+        return self.result
+
+
+class FixedReviewClient:
+    def __init__(self, result: AIReviewResult | None = None, should_fail: bool = False) -> None:
+        self.result = result or AIReviewResult(
+            verdict="looks_good",
+            summary="Generated PR matches the source diff.",
+            findings=["No invented behavior found."],
+            risk_level="low",
+            usage=AIUsage(model="review-model", prompt_version="review-test"),
+        )
+        self.should_fail = should_fail
+        self.calls: list[tuple[RepoRole, list[str]]] = []
+
+    def review_generated_pr(
+        self,
+        *,
+        pr_context: PullRequestContext,
+        repo_role: RepoRole,
+        pr_diff: str,
+        changed_files: list[str],
+    ) -> AIReviewResult:
+        self.calls.append((repo_role, changed_files))
+        if self.should_fail:
+            raise RuntimeError("review unavailable")
         return self.result
 
 
@@ -164,6 +190,38 @@ def test_worker_creates_docsite_and_playground_prs_for_source_api_change() -> No
     assert github.playground_files["src/validatorStatus.ts"] == "export const response = { validator_id: 'validator-1', reward_rate: 0.12 }\n"
     assert result.prs[0].url == "https://github.com/koredeBNB/mock-mkdocs-repo/pull/1"
     assert result.prs[1].url == "https://github.com/koredeBNB/techops-docsite-interactive-playground/pull/2"
+
+
+def test_worker_posts_secondary_review_comment_after_pr_creation() -> None:
+    worker, job, github, _, metrics = make_worker_context(diff="+ API endpoint get_validator now returns validator status")
+    reviewer = FixedReviewClient()
+    worker.reviewer = reviewer
+
+    result = worker.run(job)
+
+    assert result.status == "created_pr"
+    assert reviewer.calls == [("docsite", ["docs/api.md"])]
+    comments = github.pr_comments[("docsite", 1)]
+    assert "AI Secondary Review" in comments[0]
+    assert "Looks Good" in comments[0]
+    assert "`review-model`" in comments[0]
+    assert metrics.counters["ai_review.completed"] == 1
+    assert metrics.counters["ai_review.comment_posted"] == 1
+
+
+def test_worker_posts_review_unavailable_comment_when_secondary_review_fails() -> None:
+    worker, job, github, logger, metrics = make_worker_context(diff="+ API endpoint get_validator now returns validator status")
+    worker.reviewer = FixedReviewClient(should_fail=True)
+
+    result = worker.run(job)
+
+    assert result.status == "created_pr"
+    comments = github.pr_comments[("docsite", 1)]
+    assert "Verdict:** Not available" in comments[0]
+    assert "review unavailable" in comments[0]
+    assert metrics.counters["ai_review.failed"] == 1
+    assert metrics.counters["ai_review.comment_posted"] == 1
+    assert "ai_secondary_review_failed" in logger.as_json_lines()
 
 
 def test_worker_rejects_ai_update_that_mutates_existing_numeric_value() -> None:

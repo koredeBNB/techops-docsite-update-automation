@@ -72,6 +72,15 @@ class AIUpdateResult:
 
 
 @dataclass(frozen=True)
+class AIReviewResult:
+    verdict: Literal["looks_good", "needs_changes", "uncertain"]
+    summary: str
+    findings: list[str] = field(default_factory=list)
+    risk_level: Literal["low", "medium", "high"] = "low"
+    usage: AIUsage = field(default_factory=lambda: AIUsage(model="mock", prompt_version="review-v1"))
+
+
+@dataclass(frozen=True)
 class ValidationResult:
     ok: bool
     output: str = ""
@@ -139,9 +148,27 @@ class GitHubClient(Protocol):
     def request_repository_reviewers(self, repo_role: RepoRole, pr_number: int, reviewers: list[str]) -> None:
         ...
 
+    def fetch_repository_pr_diff(self, repo_role: RepoRole, pr_number: int) -> str:
+        ...
+
+    def comment_on_repository_pr(self, repo_role: RepoRole, pr_number: int, body: str) -> None:
+        ...
+
 
 class AIClient(Protocol):
     def propose_doc_updates(self, pr_context: PullRequestContext, docs: list[DocFile]) -> AIUpdateResult:
+        ...
+
+
+class AIReviewClient(Protocol):
+    def review_generated_pr(
+        self,
+        *,
+        pr_context: PullRequestContext,
+        repo_role: RepoRole,
+        pr_diff: str,
+        changed_files: list[str],
+    ) -> AIReviewResult:
         ...
 
 

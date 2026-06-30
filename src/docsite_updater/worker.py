@@ -3,10 +3,11 @@ from __future__ import annotations
 import re
 import time
 
-from .ai import InvalidAIOutputError
+from .ai import InvalidAIOutputError, render_review_comment, render_review_unavailable_comment
 from .config import Settings
 from .models import (
     AIClient,
+    AIReviewClient,
     CreatedPullRequest,
     DocFile,
     DocUpdate,
@@ -15,6 +16,7 @@ from .models import (
     GitHubClient,
     Logger,
     Metrics,
+    PullRequestContext,
     RepoRole,
     WorkerResult,
 )
@@ -31,10 +33,12 @@ class DocUpdateWorker:
         validator: DocsiteValidator,
         logger: Logger,
         metrics: Metrics,
+        reviewer: AIReviewClient | None = None,
     ) -> None:
         self.settings = settings
         self.github = github
         self.ai = ai
+        self.reviewer = reviewer
         self.validator = validator
         self.logger = logger
         self.metrics = metrics
@@ -136,6 +140,7 @@ class DocUpdateWorker:
             pr = self._open_update_pr(
                 repo_role=repo_role,
                 job=job,
+                pr_context=pr_context,
                 summary=ai_result.summary,
                 updates=role_updates,
             )
@@ -164,6 +169,7 @@ class DocUpdateWorker:
         *,
         repo_role: RepoRole,
         job: DocUpdateJob,
+        pr_context: PullRequestContext,
         summary: str,
         updates: list[DocUpdate],
     ) -> CreatedPullRequest | None:
@@ -186,7 +192,55 @@ class DocUpdateWorker:
         )
         if self.settings.reviewer_logins:
             self.github.request_repository_reviewers(repo_role, pr.number, list(self.settings.reviewer_logins))
+        self._post_secondary_review(repo_role=repo_role, pr=pr, pr_context=pr_context)
         return pr
+
+    def _post_secondary_review(self, *, repo_role: RepoRole, pr: CreatedPullRequest, pr_context: PullRequestContext) -> None:
+        if self.reviewer is None:
+            return
+        try:
+            pr_diff = self.github.fetch_repository_pr_diff(repo_role, pr.number)
+            review = self.reviewer.review_generated_pr(
+                pr_context=pr_context,
+                repo_role=repo_role,
+                pr_diff=pr_diff,
+                changed_files=pr.changed_files,
+            )
+            body = render_review_comment(review)
+            self.metrics.increment("ai_review.completed")
+            self.logger.info(
+                "ai_secondary_review_completed",
+                operation="ai_secondary_review",
+                status=review.verdict,
+                repo_role=repo_role,
+                pr_number=pr.number,
+                model=review.usage.model,
+            )
+        except Exception as exc:
+            self.metrics.increment("ai_review.failed")
+            reason = str(exc) or exc.__class__.__name__
+            body = render_review_unavailable_comment(reason)
+            self.logger.warning(
+                "ai_secondary_review_failed",
+                operation="ai_secondary_review",
+                status="failed",
+                repo_role=repo_role,
+                pr_number=pr.number,
+                error=reason,
+            )
+        try:
+            self.github.comment_on_repository_pr(repo_role, pr.number, body)
+            self.metrics.increment("ai_review.comment_posted")
+        except Exception as exc:
+            self.metrics.increment("ai_review.comment_failed")
+            self.logger.warning(
+                "ai_secondary_review_comment_failed",
+                operation="ai_secondary_review_comment",
+                status="failed",
+                repo_role=repo_role,
+                pr_number=pr.number,
+                error=str(exc) or exc.__class__.__name__,
+            )
 
 
 def build_pr_body(*, job: DocUpdateJob, summary: str, changed_files: list[str], repo_role: RepoRole = "docsite") -> str:

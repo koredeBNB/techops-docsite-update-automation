@@ -59,6 +59,20 @@ def test_lists_candidate_doc_files() -> None:
     assert docs[0].path == "docs/api.md"
 
 
+def test_lists_mkdocs_config_as_candidate_docsite_file() -> None:
+    github = InMemoryGitHubClient(
+        docsite_repo="koredeBNB/mock-mkdocs-repo",
+        doc_files={
+            "docs/index.md": "# Home\n",
+            "mkdocs.yml": "nav:\n  - Home: index.md\n",
+        },
+    )
+
+    docs = github.list_doc_files()
+
+    assert [doc.path for doc in docs] == ["docs/index.md", "mkdocs.yml"]
+
+
 def test_creates_branch_commits_changes_and_opens_pr() -> None:
     github = make_github()
     update = DocUpdate(path="docs/api.md", content="# API\n\nNew API docs.", rationale="API changed")
@@ -107,6 +121,22 @@ def test_request_reviewers_records_reviewers() -> None:
     github.request_reviewers(1, ["docs-reviewer"])
 
     assert github.requested_reviewers[1] == ["docs-reviewer"]
+
+
+def test_in_memory_client_fetches_diff_and_records_pr_comments() -> None:
+    github = make_github()
+    github.create_docsite_branch("ai-docs/test")
+    changed = github.commit_doc_updates(
+        "ai-docs/test",
+        [DocUpdate(path="docs/api.md", content="# API\n\nNew API docs.", rationale="API changed")],
+    )
+    pr = github.open_docsite_pr("ai-docs/test", "Update docs", "Body", changed)
+
+    diff = github.fetch_repository_pr_diff("docsite", pr.number)
+    github.comment_on_repository_pr("docsite", pr.number, "AI review comment")
+
+    assert "docs/api.md" in diff
+    assert github.pr_comments[("docsite", pr.number)] == ["AI review comment"]
 
 
 def test_write_operations_are_restricted_to_docsite_repo() -> None:
@@ -194,9 +224,14 @@ def test_github_app_client_lists_docs_commits_and_opens_pr(monkeypatch: pytest.M
         if request.method == "GET" and request.url.path == "/repos/koredeBNB/mock-mkdocs-repo":
             return httpx.Response(200, json={"default_branch": "main"})
         if request.method == "GET" and request.url.path == "/repos/koredeBNB/mock-mkdocs-repo/git/trees/main":
-            return httpx.Response(200, json={"tree": [{"type": "blob", "path": "docs/validators.md"}]})
+            return httpx.Response(
+                200,
+                json={"tree": [{"type": "blob", "path": "docs/validators.md"}, {"type": "blob", "path": "mkdocs.yml"}]},
+            )
         if request.method == "GET" and request.url.path == "/repos/koredeBNB/mock-mkdocs-repo/contents/docs/validators.md":
             return httpx.Response(200, json={"content": encoded_doc, "sha": "file-sha"})
+        if request.method == "GET" and request.url.path == "/repos/koredeBNB/mock-mkdocs-repo/contents/mkdocs.yml":
+            return httpx.Response(200, json={"content": base64.b64encode(b"nav: []\n").decode("ascii"), "sha": "mkdocs-sha"})
         if request.method == "GET" and request.url.path == "/repos/koredeBNB/mock-mkdocs-repo/git/ref/heads/main":
             return httpx.Response(200, json={"object": {"sha": "branch-sha"}})
         if request.method == "POST" and request.url.path == "/repos/koredeBNB/mock-mkdocs-repo/git/refs":
@@ -230,6 +265,7 @@ def test_github_app_client_lists_docs_commits_and_opens_pr(monkeypatch: pytest.M
     pr = client.open_docsite_pr("ai-docs/test", "Update docs", "Body", changed)
     client.request_reviewers(pr.number, ["koredeBNB"])
 
+    assert [doc.path for doc in docs] == ["docs/validators.md", "mkdocs.yml"]
     assert docs[0].content == doc_content
     assert changed == ["docs/validators.md"]
     assert seen["put_payload"]["branch"] == "ai-docs/test"
@@ -237,6 +273,37 @@ def test_github_app_client_lists_docs_commits_and_opens_pr(monkeypatch: pytest.M
     assert seen["pull_payload"] == {"title": "Update docs", "body": "Body", "head": "ai-docs/test", "base": "main"}
     assert seen["review_payload"] == {"reviewers": ["koredeBNB"]}
     assert pr.url == "https://github.com/koredeBNB/mock-mkdocs-repo/pull/3"
+
+
+def test_github_app_client_fetches_pr_diff_and_comments(monkeypatch: pytest.MonkeyPatch) -> None:
+    seen: dict[str, object] = {"comment_payload": None}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "POST" and request.url.path == "/app/installations/42/access_tokens":
+            return httpx.Response(201, json={"token": "installation-token"})
+        if request.method == "GET" and request.url.path == "/repos/koredeBNB/mock-mkdocs-repo/pulls/3":
+            if request.headers.get("accept") == "application/vnd.github.v3.diff":
+                return httpx.Response(200, text="diff --git a/docs/index.md b/docs/index.md")
+            return httpx.Response(200, json={"html_url": "https://github.com/koredeBNB/mock-mkdocs-repo/pull/3"})
+        if request.method == "POST" and request.url.path == "/repos/koredeBNB/mock-mkdocs-repo/issues/3/comments":
+            seen["comment_payload"] = json.loads(request.content)
+            return httpx.Response(201, json={"id": 99})
+        return httpx.Response(404, json={"message": f"not found: {request.method} {request.url.path}"})
+
+    client = GitHubAppClient(
+        app_id="123",
+        private_key="private",
+        docsite_repo="koredeBNB/mock-mkdocs-repo",
+        client=httpx.Client(transport=httpx.MockTransport(handler)),
+    )
+    monkeypatch.setattr(client, "_app_jwt", lambda: "app-jwt")
+    client.create_installation_token(42)
+
+    diff = client.fetch_repository_pr_diff("docsite", 3)
+    client.comment_on_repository_pr("docsite", 3, "AI review comment")
+
+    assert "docs/index.md" in diff
+    assert seen["comment_payload"] == {"body": "AI review comment"}
 
 
 def test_github_app_client_can_create_new_files(monkeypatch: pytest.MonkeyPatch) -> None:

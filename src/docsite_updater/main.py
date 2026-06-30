@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from .ai import create_ai_client
+from .ai import create_ai_client, create_ai_reviewer
 from .config import Settings
 from .github import create_github_client
 from .observability import MemoryLogger, MemoryMetrics
@@ -15,7 +15,8 @@ metrics = MemoryMetrics()
 queue = InMemoryJobQueue(max_retries=settings.max_retries, logger=logger, metrics=metrics)
 github = create_github_client(settings)
 ai = create_ai_client(settings)
+reviewer = create_ai_reviewer(settings)
 validator = MockMkDocsValidator()
-worker = DocUpdateWorker(settings=settings, github=github, ai=ai, validator=validator, logger=logger, metrics=metrics)
+worker = DocUpdateWorker(settings=settings, github=github, ai=ai, validator=validator, logger=logger, metrics=metrics, reviewer=reviewer)
 
 app = create_app(settings=settings, queue=queue, logger=logger, metrics=metrics, job_handler=worker.run)

@@ -38,6 +38,8 @@ class InMemoryGitHubClient:
     playground_files: dict[str, str] = field(default_factory=dict)
     branches: set[str] = field(default_factory=set)
     pull_requests: list[CreatedPullRequest] = field(default_factory=list)
+    pr_diffs: dict[tuple[RepoRole, int], str] = field(default_factory=dict)
+    pr_comments: dict[tuple[RepoRole, int], list[str]] = field(default_factory=dict)
     requested_reviewers: dict[int, list[str]] = field(default_factory=dict)
     installation_tokens: list[int] = field(default_factory=list)
     allowed_write_repo: str | None = None
@@ -64,7 +66,11 @@ class InMemoryGitHubClient:
         )
 
     def list_doc_files(self) -> list[DocFile]:
-        return [DocFile(path=path, content=content, repo_role="docsite") for path, content in sorted(self.doc_files.items())]
+        return [
+            DocFile(path=path, content=content, repo_role="docsite")
+            for path, content in sorted(self.doc_files.items())
+            if _is_doc_file(path)
+        ]
 
     def list_playground_files(self) -> list[DocFile]:
         if not self.playground_repo:
@@ -123,11 +129,20 @@ class InMemoryGitHubClient:
             repo=repo,
         )
         self.pull_requests.append(pr)
+        self.pr_diffs[(repo_role, pr.number)] = "\n".join(f"diff -- {path}" for path in changed_files)
         return pr
 
     def request_repository_reviewers(self, repo_role: RepoRole, pr_number: int, reviewers: list[str]) -> None:
         self._assert_can_write_repo(repo_role)
         self.requested_reviewers[pr_number] = reviewers
+
+    def fetch_repository_pr_diff(self, repo_role: RepoRole, pr_number: int) -> str:
+        self._assert_can_write_repo(repo_role)
+        return self.pr_diffs.get((repo_role, pr_number), "")
+
+    def comment_on_repository_pr(self, repo_role: RepoRole, pr_number: int, body: str) -> None:
+        self._assert_can_write_repo(repo_role)
+        self.pr_comments.setdefault((repo_role, pr_number), []).append(body)
 
     def _assert_can_write_docsite(self) -> None:
         self._assert_can_write_repo("docsite")
@@ -307,6 +322,26 @@ class GitHubAppClient:
         )
         response.raise_for_status()
 
+    def fetch_repository_pr_diff(self, repo_role: RepoRole, pr_number: int) -> str:
+        owner, repo = _split_repo(self._repo_for_role(repo_role))
+        response = self._client().get(
+            self._url(f"/repos/{owner}/{repo}/pulls/{pr_number}"),
+            headers={**self._installation_headers(), "Accept": "application/vnd.github.v3.diff"},
+            timeout=self.timeout_seconds,
+        )
+        response.raise_for_status()
+        return response.text
+
+    def comment_on_repository_pr(self, repo_role: RepoRole, pr_number: int, body: str) -> None:
+        owner, repo = _split_repo(self._repo_for_role(repo_role))
+        response = self._client().post(
+            self._url(f"/repos/{owner}/{repo}/issues/{pr_number}/comments"),
+            headers=self._installation_headers(),
+            json={"body": body},
+            timeout=self.timeout_seconds,
+        )
+        response.raise_for_status()
+
     def _docsite_branch(self) -> str:
         return self._default_branch_for_repo("docsite")
 
@@ -420,7 +455,10 @@ def _split_repo(full_name: str) -> tuple[str, str]:
 
 
 def _is_doc_file(path: str) -> bool:
-    return path.startswith("docs/") and path.lower().endswith((".md", ".mdx", ".rst", ".txt", ".adoc"))
+    lowered = path.lower()
+    if lowered in {"mkdocs.yml", "mkdocs.yaml"}:
+        return True
+    return path.startswith("docs/") and lowered.endswith((".md", ".mdx", ".rst", ".txt", ".adoc"))
 
 
 def _is_playground_file(path: str) -> bool:
